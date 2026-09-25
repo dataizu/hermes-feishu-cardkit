@@ -18,8 +18,11 @@ dropped reply.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -302,6 +305,7 @@ class CardStreamState:
     card_id: str
     message_id: str = ""
     chat_id: str = ""
+    turn_key: str = ""  # (chat, reply_to) — identifies the turn a card belongs to
     seq: int = 1
     start_ts: float = field(default_factory=time.monotonic)
     last_pushed: str = ""
@@ -310,6 +314,53 @@ class CardStreamState:
     finalized: bool = False  # sealed by a finalize edit; later finalize edits short-circuit
     failed: bool = False  # latched on first hard failure → caller falls back for the rest of the turn
     tool_lines: "list[str]" = field(default_factory=list)  # folded tool-progress lines (collapsible panel)
+    # ── cross-segment resume (one card per turn) ──
+    sealed_text: str = ""  # text the card showed when last sealed (segment break)
+    sealed_at: float = 0.0
+    resume_base: str = ""  # prior segments' text prepended when the model does NOT restate
+    replace_mode: Optional[bool] = None  # True = model restated (drop resume_base); None = undetermined
+    last_visible_text: str = ""  # full text currently shown in the card (sealed prefix + live)
+
+
+def strip_cursor_all(text: str) -> str:
+    """Remove the streaming cursor anywhere it appears (trailing, or mid-table like '| 阵雨▌')."""
+    for cursor in (" ▉", "▉", "▌", " ▌"):
+        text = text.replace(cursor, "")
+    return text
+
+
+def _normalize_for_compare(text: str) -> str:
+    """Whitespace-insensitive comparable form for restatement detection."""
+    return re.sub(r"\s+", "", text)
+
+
+def detect_restatement(sealed_text: str, new_text: str, *, min_overlap_chars: int = 12) -> Optional[bool]:
+    """Detect whether ``new_text`` RESTATES the sealed content (model re-answers from scratch
+    after a tool boundary) or CONTINUES it.
+
+    Returns:
+        True  — new_text starts with (≈) the sealed text → replace mode: stream new_text alone
+        False — new_text is fresh continuation            → prepend sealed_text
+        None  — undetermined (too short/ambiguous)        → keep prior mode
+    """
+    if not sealed_text or not new_text:
+        return None
+    a, b = _normalize_for_compare(sealed_text), _normalize_for_compare(new_text)
+    if len(b) < min_overlap_chars:
+        return None
+    # Continuation heuristic: the new segment text is NOT a prefix-extension of the sealed
+    # text, and doesn't start with it → treat as restatement when overlap is significant.
+    if b.startswith(a):
+        return True  # new text fully restates and extends the sealed content
+    # common-prefix length between sealed and new
+    common = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        common += 1
+    if common >= min_overlap_chars:
+        return True  # substantial shared prefix = restated answer
+    return False
 
 
 class CardKitStreamManager:
@@ -366,11 +417,23 @@ class CardKitStreamManager:
     async def stream_content(self, state: CardStreamState, content: str) -> None:
         """Cumulative text push to the streaming element (typewriter diff on the client).
 
+        Cross-segment resume: after a segment break the card stays alive; a resumed
+        stream either CONTINUES (prepend the sealed prefix) or REPLACES (the model
+        restated — drop the sealed prefix to avoid duplicate content in the card).
+
         ZCode-calibrated throttling: ≥1s between pushes (the client-side diff animates
         in between), single-call timeout 15s, exponential backoff 1s→2s→4s, circuit
         breaker after 3 consecutive failures.
         """
         from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
+
+        push = content
+        if state.sealed_text:
+            if state.replace_mode is None:
+                state.replace_mode = detect_restatement(state.sealed_text, content) or False
+            if not state.replace_mode:
+                push = state.sealed_text + ("\n\n" if state.sealed_text else "") + content
+        state.last_visible_text = push
 
         now = time.monotonic()
         wait = state.last_push_ts + _PUSH_MIN_INTERVAL - now
@@ -406,6 +469,19 @@ class CardKitStreamManager:
         state.fail_count += 3  # exhausted retries → circuit breaker trips in the adapter
         raise last_exc or RuntimeError("cardElement.content failed")
 
+    async def seal_card(
+        self, state: CardStreamState, text: str, *, model: Optional[str] = None,
+    ) -> None:
+        """Segment break: freeze the card content WITHOUT the completed look.
+
+        The card keeps its streaming element (last visible text) so the SAME card can
+        resume when the next segment starts. No footer, no streaming_mode close —
+        one card per turn.
+        """
+        state.sealed_text = state.last_visible_text or strip_cursor_all(text)
+        state.sealed_at = time.monotonic()
+        # keep streaming_mode ON so the element stays live for the resumed segment
+
     async def finalize_card(
         self, state: CardStreamState, text: str, *, is_error: bool = False, model: Optional[str] = None,
     ) -> None:
@@ -414,9 +490,19 @@ class CardKitStreamManager:
         from lark_oapi.api.cardkit.v1.model.card import Card as _CardModel
         from lark_oapi.api.cardkit.v1.model.update_card_request_body import UpdateCardRequestBody
 
+        # One card per turn: the final text = sealed prefix + live suffix unless the
+        # model restated (replace mode), in which case the live text alone is complete.
+        final = strip_cursor_all(text)
+        if state.sealed_text and not (state.replace_mode is True):
+            candidate = state.sealed_text + ("\n\n" if state.sealed_text else "") + final
+            # If the final ALREADY contains the sealed prefix (framework delivered whole
+            # text), don't duplicate it.
+            if _normalize_for_compare(final).startswith(_normalize_for_compare(state.sealed_text)):
+                candidate = final
+            final = candidate
         elapsed_ms = (time.monotonic() - state.start_ts) * 1000.0
         show_footer = footer_enabled()
-        card_json = build_completed_card(text, elapsed_ms=elapsed_ms, model=model, is_error=is_error,
+        card_json = build_completed_card(final, elapsed_ms=elapsed_ms, model=model, is_error=is_error,
                                          show_footer=show_footer, tool_lines=state.tool_lines)
         state.seq += 1
         card_model = _CardModel.builder().type("card_json").data(json.dumps(card_json, ensure_ascii=False)).build()
