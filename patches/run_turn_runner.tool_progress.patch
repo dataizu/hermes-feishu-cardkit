@@ -1,0 +1,16 @@
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -590,8 +590,12 @@
+
+     async def _send_progress_text(self, st, text: str):
+         ctx = self._ctx
++        # tool_progress marker: lets card-capable adapters (Feishu CardKit) fold these
++        # into the streaming card's collapsible tool panel instead of separate bubbles.
++        # Unknown metadata keys are ignored by every other adapter — additive only.
+         result = await st.adapter.send(
+-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
++            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to,
++            metadata={**(ctx._progress_metadata or {}), "tool_progress": True},
+         )
+         self._track_progress_result(result)
+         return result

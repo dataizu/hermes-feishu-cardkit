@@ -1,0 +1,26 @@
+name: hermes-feishu-cardkit
+label: Feishu CardKit Streaming
+kind: platform
+version: 1.0.0
+description: >
+  Drop-in upgrade for the built-in Feishu/Lark gateway channel: replies render as
+  CardKit 2.0 streaming cards (typewriter effect, collapsible tool-summary panel,
+  status/elapsed/model footer) instead of plain text edits. Registers over the
+  built-in "feishu" platform, so existing env/config keeps working unchanged.
+author: AgentHub COO
+requires_env:
+  - name: FEISHU_APP_ID
+    description: "Feishu/Lark app ID (same as built-in feishu channel)"
+    url: "https://open.feishu.cn/"
+    password: false
+  - name: FEISHU_APP_SECRET
+    description: "Feishu/Lark app secret"
+    url: "https://open.feishu.cn/"
+    password: true
+optional_env:
+  - name: FEISHU_CARDKIT_STREAMING
+    description: "Set 0/false to disable CardKit cards (falls back to text streaming)"
+    password: false
+  - name: FEISHU_CARDKIT_FOOTER
+    description: "Set 0/false to hide the status/elapsed footer on completed cards"
+    password: false
