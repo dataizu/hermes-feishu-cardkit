@@ -430,7 +430,7 @@ class CardKitStreamManager:
         push = content
         if state.sealed_text:
             if state.replace_mode is None:
-                state.replace_mode = detect_restatement(state.sealed_text, content) or False
+                state.replace_mode = detect_restatement(state.sealed_text, content)  # None on short input
             if not state.replace_mode:
                 push = state.sealed_text + ("\n\n" if state.sealed_text else "") + content
         state.last_visible_text = push
@@ -445,7 +445,7 @@ class CardKitStreamManager:
             try:
                 state.seq += 1
                 body = (ContentCardElementRequestBody.builder()
-                        .content(content)
+                        .content(push)  # FIX: push the RESUMED text (sealed prefix + new segment)
                         .sequence(state.seq)
                         .build())
                 req = (ContentCardElementRequest.builder()

@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import BasePlatformAdapter, PlatformConfig, SendResult
@@ -69,6 +70,13 @@ _CURSOR = " ▉"
 # Segment-break resumes arrive quickly (the next segment starts or more tools
 # fire within a couple of seconds); the turn-final commits after this window.
 _FINALIZE_DELAY_S = 3.5
+# Quiet mode (CEO 2026-09-25): Feishu = task in → result out. Tool progress and
+# status heartbeats are swallowed entirely (no bubbles, no tool panel). Opt back
+# into the collapsible tool panel with FEISHU_CARDKIT_TOOL_PANEL=1.
+_QUIET_DEFAULT = os.environ.get("FEISHU_CARDKIT_QUIET", "1") not in ("0", "false", "no", "off")
+_TOOL_PANEL_ON = os.environ.get("FEISHU_CARDKIT_TOOL_PANEL", "0") in ("1", "true", "yes", "on")
+# Sentinel id returned for swallowed quiet-mode sends so callers can detect it.
+_QUIET_SENTINEL = "quiet:swallowed"
 
 
 def _cardkit_available() -> bool:
@@ -164,9 +172,27 @@ if _BUILTIN_AVAILABLE:
             if not self._client:
                 return SendResult(success=False, error="Not connected")
 
-            # Tool-progress lines: fold into the live card's collapsible panel and
-            # cancel any pending finalize (tools running = the turn continues).
-            if (metadata or {}).get("tool_progress") and self._cardkit_states:
+            md = metadata or {}
+
+            # Quiet mode (default, CEO 2026-09-25): Feishu = task in → result out.
+            # Tool records, status heartbeats and interim advisories are swallowed
+            # BEFORE they ever hit the chat — no bubbles, no "(已编辑)" panels.
+            if _QUIET_DEFAULT:
+                state_q = self._live_card_for_chat(chat_id)
+                if state_q is not None:
+                    # the turn is alive: a pending finalize must not fire mid-work
+                    self._cancel_pending_finalize(state_q.message_id)
+                if md.get("tool_progress"):
+                    if state_q is not None and _TOOL_PANEL_ON:
+                        state_q.tool_lines.append(content.strip())
+                        state_q.tool_lines = state_q.tool_lines[-40:]
+                    return SendResult(success=True, message_id=_QUIET_SENTINEL)
+                if md.get("_interim_send") and not md.get("expect_edits"):
+                    return SendResult(success=True, message_id=_QUIET_SENTINEL)
+
+            # Tool-progress lines (non-quiet mode): fold into the live card's
+            # collapsible panel and cancel any pending finalize.
+            elif md.get("tool_progress") and self._cardkit_states:
                 state = self._live_card_for_chat(chat_id)
                 if state is not None:
                     self._cancel_pending_finalize(state.message_id)
@@ -176,7 +202,7 @@ if _BUILTIN_AVAILABLE:
                     return SendResult(success=True, message_id=state.message_id)
 
             # Streaming FIRST frame: resume a live card (segment break) or open one.
-            if (metadata or {}).get("expect_edits") and self._cardkit_streaming_available():
+            if md.get("expect_edits") and self._cardkit_streaming_available():
                 existing = self._live_card_for_chat(chat_id)
                 if existing is not None:
                     # One card per turn: adopt the sealed card for the next segment.
