@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("gateway.feishu.cardkit")
 
 STREAMING_ELEMENT_ID = "streaming_content"
+STATUS_ELEMENT_ID = "status_line"
 _LOADING_ICON_KEY = ""  # empty = skip the loading icon (avoid depending on an app-uploaded image key)
 
 # ZCode-calibrated streaming hygiene: ≥1s between element pushes (client-side
@@ -174,15 +175,32 @@ def chunk_card_text(text: str, limit: int = 3800) -> "list[str]":
     return chunks
 
 
-def build_streaming_card(*, show_loading_icon: bool = False) -> Dict[str, Any]:
-    """Initial CardKit 2.0 streaming card: empty streaming element + optional loading icon."""
-    elements: list = [{
+def build_streaming_card(
+    *, show_loading_icon: bool = False, status_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Initial CardKit 2.0 streaming card: optional status line + streaming element.
+
+    ``status_text`` (quiet-mode "⏳ 处理中…" line, CEO option 2, 2026-09-25) renders
+    as a grey notation-sized line pinned ABOVE the streaming content; the completed
+    card replaces the whole card so the status disappears at turn end.
+    """
+    elements: list = []
+    if status_text:
+        elements.append({
+            "tag": "markdown",
+            "content": status_text,
+            "text_align": "left",
+            "text_size": "notation",
+            "text_color": "grey",
+            "element_id": STATUS_ELEMENT_ID,
+        })
+    elements.append({
         "tag": "markdown",
         "content": "",
         "text_align": "left",
         "text_size": "normal_v2",
         "element_id": STREAMING_ELEMENT_ID,
-    }]
+    })
     if show_loading_icon and _LOADING_ICON_KEY:
         elements.append({
             "tag": "markdown",
@@ -319,6 +337,7 @@ class CardStreamState:
     sealed_at: float = 0.0
     resume_base: str = ""  # prior segments' text prepended when the model does NOT restate
     replace_mode: Optional[bool] = None  # True = model restated (drop resume_base); None = undetermined
+    status_last_ts: float = 0.0  # last status-line push (throttle)
     last_visible_text: str = ""  # full text currently shown in the card (sealed prefix + live)
 
 
@@ -383,12 +402,13 @@ class CardKitStreamManager:
 
     async def create_and_send_streaming_card(
         self, chat_id: str, *, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+        status_text: Optional[str] = None,
     ) -> CardStreamState:
         """create card entity → send interactive message referencing it."""
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
         from lark_oapi.api.cardkit.v1.model.card import Card as _CardModel
 
-        card_json = build_streaming_card()
+        card_json = build_streaming_card(status_text=status_text)
         body = (CreateCardRequestBody.builder()
                 .type("card_json")
                 .data(json.dumps(card_json, ensure_ascii=False))
@@ -536,6 +556,32 @@ class CardKitStreamManager:
         if cursor and text.endswith(cursor):
             return text[: -len(cursor)]
         return text
+
+    async def update_status_text(self, state: CardStreamState, status_text: str) -> None:
+        """Update the grey status line ABOVE the streaming content (quiet-mode progress).
+
+        Pushes to the dedicated ``status_line`` element; throttled to one update per
+        5s (content rarely changes faster and CardKit pushes aren't free).
+        """
+        from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
+
+        now = time.monotonic()
+        if now - state.status_last_ts < 5.0:
+            return
+        state.status_last_ts = now
+        state.seq += 1
+        body = (ContentCardElementRequestBody.builder()
+                .content(status_text)
+                .sequence(state.seq)
+                .build())
+        req = (ContentCardElementRequest.builder()
+               .card_id(state.card_id)
+               .element_id(STATUS_ELEMENT_ID)
+               .request_body(body)
+               .build())
+        resp = await self._api(self._client().cardkit.v1.card_element.content, req)
+        if not getattr(resp, "success", lambda: False)():
+            raise RuntimeError(f"status cardElement.content failed: {getattr(resp, 'code', '?')}")
 
 
 def _extract_message_id(response: Any) -> Optional[str]:

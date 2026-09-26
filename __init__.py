@@ -177,13 +177,30 @@ if _BUILTIN_AVAILABLE:
             # Quiet mode (default, CEO 2026-09-25): Feishu = task in → result out.
             # Tool records, status heartbeats and interim advisories are swallowed
             # BEFORE they ever hit the chat — no bubbles, no "(已编辑)" panels.
+            # One card per turn is opened EARLY (first tool progress) with a grey
+            # "⏳ 处理中…" status line (CEO option 2) so long quiet turns don't read
+            # as stuck; the status disappears when the completed card renders.
             if _QUIET_DEFAULT:
                 state_q = self._live_card_for_chat(chat_id)
                 if state_q is not None:
                     # the turn is alive: a pending finalize must not fire mid-work
                     self._cancel_pending_finalize(state_q.message_id)
                 if md.get("tool_progress"):
-                    if state_q is not None and _TOOL_PANEL_ON:
+                    if state_q is None:
+                        # open the turn card NOW (first sign of work) with the status line
+                        try:
+                            if self._cardkit is None:
+                                self._cardkit = CardKitStreamManager(self)
+                            state_q = await self._cardkit.create_and_send_streaming_card(
+                                chat_id, reply_to=reply_to, metadata=metadata,
+                                status_text="⏳ 处理中…")
+                            self._cardkit_states[state_q.message_id] = state_q
+                            while len(self._cardkit_states) > 32:
+                                self._cardkit_states.pop(next(iter(self._cardkit_states)), None)
+                        except Exception as exc:
+                            logger.warning("[CardKit] quiet-mode early card open failed: %s", exc)
+                            self._cardkit_streaming_on = False
+                    elif _TOOL_PANEL_ON:
                         state_q.tool_lines.append(content.strip())
                         state_q.tool_lines = state_q.tool_lines[-40:]
                     return SendResult(success=True, message_id=_QUIET_SENTINEL)
