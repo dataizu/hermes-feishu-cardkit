@@ -316,6 +316,88 @@ def build_completed_card(text: str, *, elapsed_ms: Optional[float], model: Optio
     }
 
 
+def build_cron_card(title: str, content: str, *, job_name: Optional[str] = None,
+                    timestamp: Optional[str] = None) -> Dict[str, Any]:
+    """Static card for cron/scheduled deliveries (unified look, CEO 2026-09-26).
+
+    Grey header line: ⏰ job name + delivery time; body: the job's content styled
+    like a completed card (no streaming, no footer — it arrives finished).
+    """
+    header_parts = ["⏰ " + (job_name or title or "定时任务")]
+    if timestamp:
+        header_parts.append(timestamp)
+    elements: list = [{
+        "tag": "markdown",
+        "content": " · ".join(header_parts),
+        "i18n_content": {"zh_cn": " · ".join(header_parts), "en_us": " · ".join(header_parts)},
+        "text_size": "notation",
+        "text_color": "grey",
+        "element_id": "cron_header",
+    }]
+    styled = optimize_markdown_style(content) if content else ""
+    elements.extend(
+        {"tag": "markdown", "content": chunk, "text_align": "left", "text_size": "normal_v2"}
+        for chunk in (chunk_card_text(styled) or ["（无内容）"])
+    )
+    return {
+        "schema": "2.0",
+        "config": {
+            "streaming_mode": False,
+            "locales": ["zh_cn", "en_us"],
+            "update_multi": True,
+            "summary": {
+                "content": "Scheduled delivery",
+                "i18n_content": {"zh_cn": "定时投递", "en_us": "Scheduled delivery"},
+            },
+        },
+        "body": {"elements": elements},
+    }
+
+
+def build_clarify_card(question: str, choices: "list[str]", *, clarify_id: str) -> Dict[str, Any]:
+    """Interactive choice card: question + one button per option (CEO 2026-09-26).
+
+    Schema 2.0 rules (validated against the real API, 2026-09-30): the legacy
+    ``action`` container is REJECTED (200861) — buttons go directly into
+    ``elements`` with ``behaviors: [{type: "callback", value: ...}]``. Clicks
+    arrive at the adapter's card-action handler with the behavior's ``value``
+    as ``action.value``; the handler resolves the clarify and swaps this card
+    to the picked choice (buttons removed). Callback responses must NOT carry
+    a 2.0 raw card (client rejects with 200673) — plain ack only.
+    """
+    buttons = []
+    for i, choice in enumerate(choices, start=1):
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": f"{i}. {choice}"[:21]},
+            "type": "default",
+            "behaviors": [{"type": "callback",
+                           "value": {"hermes_clarify": {"clarify_id": clarify_id, "index": i - 1,
+                                                        "choice": str(choice)}}}],
+        })
+    elements: list = [{
+        "tag": "markdown",
+        "content": question,
+        "text_align": "left",
+        "text_size": "normal_v2",
+        "element_id": "clarify_question",
+    }]
+    elements.extend(buttons)
+    return {
+        "schema": "2.0",
+        "config": {
+            "streaming_mode": False,
+            "locales": ["zh_cn", "en_us"],
+            "update_multi": True,
+            "summary": {
+                "content": "Waiting for your choice",
+                "i18n_content": {"zh_cn": "等待选择", "en_us": "Waiting for your choice"},
+            },
+        },
+        "body": {"elements": elements},
+    }
+
+
 @dataclass
 class CardStreamState:
     """Book-keeping for ONE streaming card within a chat turn."""
@@ -556,6 +638,50 @@ class CardKitStreamManager:
         if cursor and text.endswith(cursor):
             return text[: -len(cursor)]
         return text
+
+    async def send_static_card(self, chat_id: str, card_json: Dict[str, Any], *,
+                               reply_to: Optional[str] = None,
+                               metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Create a static (non-streaming) card and send it into the chat."""
+        from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+        from lark_oapi.api.cardkit.v1.model.card import Card as _CardModel
+
+        body = (CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card_json, ensure_ascii=False))
+                .build())
+        req = CreateCardRequest.builder().request_body(body).build()
+        resp = await self._api(self._client().cardkit.v1.card.create, req)
+        if not getattr(resp, "success", lambda: False)():
+            raise RuntimeError(f"card.create failed: {getattr(resp, 'code', '?')} {getattr(resp, 'msg', '')}")
+        card_id = getattr(getattr(resp, "data", None), "card_id", None)
+        if not card_id:
+            raise RuntimeError("card.create returned no card_id")
+        payload = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+        response = await self._adapter._feishu_send_with_retry(
+            chat_id=chat_id, msg_type="interactive", payload=payload, reply_to=reply_to, metadata=metadata,
+        )
+        result = self._adapter._finalize_send_result(response, "cardkit static card send failed")
+        if result.success and result.message_id:
+            # record card_id so the adapter can update this card later (clarify swap)
+            getattr(self._adapter, "_clarify_card_ids", {}).setdefault(result.message_id, card_id)
+        return result
+
+    async def update_card(self, card_id: str, card_json: Dict[str, Any], *, sequence: int = 1) -> None:
+        """Replace a static card's content (e.g. clarify card after a choice was picked)."""
+        from lark_oapi.api.cardkit.v1 import UpdateCardRequest
+        from lark_oapi.api.cardkit.v1.model.card import Card as _CardModel
+        from lark_oapi.api.cardkit.v1.model.update_card_request_body import UpdateCardRequestBody
+
+        card_model = _CardModel.builder().type("card_json").data(json.dumps(card_json, ensure_ascii=False)).build()
+        body = (UpdateCardRequestBody.builder()
+                .card(card_model)
+                .sequence(sequence)
+                .build())
+        req = UpdateCardRequest.builder().card_id(card_id).request_body(body).build()
+        resp = await self._api(self._client().cardkit.v1.card.update, req)
+        if not getattr(resp, "success", lambda: False)():
+            raise RuntimeError(f"card.update failed: {getattr(resp, 'code', '?')} {getattr(resp, 'msg', '')}")
 
     async def update_status_text(self, state: CardStreamState, status_text: str) -> None:
         """Update the grey status line ABOVE the streaming content (quiet-mode progress).

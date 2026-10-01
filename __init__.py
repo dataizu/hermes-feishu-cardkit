@@ -64,6 +64,8 @@ from .cardkit_stream import (
     cardkit_enabled,
     cardkit_sdk_available,
     strip_cursor_all,
+    build_cron_card,
+    build_clarify_card,
 )
 
 _CURSOR = " ▉"
@@ -99,6 +101,9 @@ if _BUILTIN_AVAILABLE:
             self._cardkit: Optional[CardKitStreamManager] = None
             self._cardkit_streaming_on = True  # process-lifetime latch; False after a hard failure
             self._cardkit_pending: Dict[str, asyncio.Task] = {}  # message_id → delayed finalize task
+            # clarify button cards (CEO 2026-09-26): clarify_id → bookkeeping dict
+            self._clarify_cards: Dict[str, Dict[str, Any]] = {}
+            self._clarify_card_ids: Dict[str, str] = {}  # message_id → card_id (filled by manager)
 
         # ── helpers ────────────────────────────────────────────────────────
 
@@ -173,6 +178,23 @@ if _BUILTIN_AVAILABLE:
                 return SendResult(success=False, error="Not connected")
 
             md = metadata or {}
+
+            # Cron/scheduled deliveries (metadata carries job_id): render as a static
+            # card so every Feishu surface has the unified look (CEO 2026-09-26).
+            if md.get("job_id") and self._cardkit_streaming_available():
+                try:
+                    from datetime import datetime as _dt
+                    if self._cardkit is None:
+                        self._cardkit = CardKitStreamManager(self)
+                    card_json = build_cron_card(
+                        md.get("job_name") or "定时任务", content,
+                        job_name=md.get("job_name"),
+                        timestamp=_dt.now().strftime("%m-%d %H:%M"),
+                    )
+                    return await self._cardkit.send_static_card(chat_id, card_json, metadata=metadata)
+                except Exception as exc:
+                    logger.warning("[CardKit] cron card send failed, falling back to text: %s", exc)
+                    # fall through to the inherited text send
 
             # Quiet mode (default, CEO 2026-09-25): Feishu = task in → result out.
             # Tool records, status heartbeats and interim advisories are swallowed
@@ -271,6 +293,100 @@ if _BUILTIN_AVAILABLE:
                     self._cardkit_streaming_on = False  # latch off; text path takes over
 
             return await super().edit_message(chat_id, message_id, content, finalize=finalize)
+
+        # ── clarify buttons (CEO 2026-09-26): native choice card ──────────
+
+        async def send_clarify(
+            self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+            session_key: str, metadata: Optional[Dict[str, Any]] = None,
+        ) -> SendResult:
+            """Multiple-choice clarify as a CardKit button card; open-ended falls back.
+
+            Clicks resolve via the card-action path (``hermes_clarify`` value) which
+            calls ``resolve_gateway_clarify``; the card then swaps to the picked
+            choice. Fails soft to the inherited numbered-list text prompt.
+            """
+            if choices and self._cardkit_streaming_available():
+                try:
+                    if self._cardkit is None:
+                        self._cardkit = CardKitStreamManager(self)
+                    card_json = build_clarify_card(question, choices, clarify_id=clarify_id)
+                    result = await self._cardkit.send_static_card(chat_id, card_json, metadata=metadata)
+                    if result.success and result.message_id:
+                        self._clarify_cards[clarify_id] = {
+                            "card_id": self._clarify_card_ids.get(result.message_id),
+                            "message_id": result.message_id,
+                            "question": question, "choices": list(choices),
+                        }
+                    return result
+                except Exception as exc:
+                    logger.warning("[CardKit] clarify card failed, falling back to text: %s", exc)
+            return await super().send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata=metadata)
+
+        def _on_card_action_trigger(self, data: Any) -> Any:
+            """Intercept ``hermes_clarify`` button clicks BEFORE the built-in routing.
+
+            Resolve the clarify, swap the card to the picked choice (buttons removed),
+            and return an inline card response so all clients sync. Everything else
+            falls through to the built-in handler (approval buttons, /card commands).
+            """
+            try:
+                event = getattr(data, "event", None)
+                action = getattr(event, "action", None)
+                value = getattr(action, "value", {}) or {}
+                payload = value.get("hermes_clarify") if isinstance(value, dict) else None
+                if not payload:
+                    return super()._on_card_action_trigger(data)
+                clarify_id = str(payload.get("clarify_id") or "")
+                choice = str(payload.get("choice") or "")
+                if not clarify_id or not choice:
+                    return super()._on_card_action_trigger(data)
+
+                from tools.clarify_gateway import resolve_gateway_clarify
+                resolved = resolve_gateway_clarify(clarify_id, choice)
+                info = self._clarify_cards.pop(clarify_id, None)
+                loop = self._loop
+                if info and loop is not None and self._loop_accepts_callbacks(loop):
+                    async def _swap() -> None:
+                        try:
+                            if self._cardkit is None:
+                                self._cardkit = CardKitStreamManager(self)
+                            card_json = build_clarify_card(
+                                info["question"], info["choices"], clarify_id=clarify_id)
+                            # answered look: question + picked choice, no buttons
+                            answered = {
+                                "schema": "2.0",
+                                "config": {"streaming_mode": False, "locales": ["zh_cn", "en_us"],
+                                           "update_multi": True,
+                                           "summary": {"content": "Choice made",
+                                                       "i18n_content": {"zh_cn": "已选择",
+                                                                        "en_us": "Choice made"}}},
+                                "body": {"elements": [
+                                    {"tag": "markdown", "content": info["question"],
+                                     "text_align": "left", "text_size": "normal_v2"},
+                                    {"tag": "markdown",
+                                     "content": f"✅ 已选择：**{choice}**",
+                                     "text_size": "notation"},
+                                ]},
+                            }
+                            card_id = info.get("card_id") or ""
+                            if card_id:
+                                await self._cardkit.update_card(card_id, answered, sequence=2)
+                        except Exception as exc:
+                            logger.debug("[CardKit] clarify card swap failed: %s", exc)
+                    from agent.async_utils import safe_schedule_threadsafe
+                    safe_schedule_threadsafe(
+                        _swap(), loop, logger=logger,
+                        log_message="[CardKit] clarify swap scheduling failed")
+                if not resolved:
+                    # stale click (already answered/timeout): still swap the card look
+                    logger.info("[feishu-cardkit] clarify click for expired id=%s", clarify_id)
+                # inline card response not needed (we async-swap); return plain ack
+                return self._card_response()
+            except Exception as exc:
+                logger.warning("[feishu-cardkit] clarify click handling failed: %s", exc)
+                return super()._on_card_action_trigger(data)
 
 
 def _check_requirements() -> bool:
