@@ -77,8 +77,31 @@ _FINALIZE_DELAY_S = 3.5
 # into the collapsible tool panel with FEISHU_CARDKIT_TOOL_PANEL=1.
 _QUIET_DEFAULT = os.environ.get("FEISHU_CARDKIT_QUIET", "1") not in ("0", "false", "no", "off")
 _TOOL_PANEL_ON = os.environ.get("FEISHU_CARDKIT_TOOL_PANEL", "0") in ("1", "true", "yes", "on")
-# Sentinel id returned for swallowed quiet-mode sends so callers can detect it.
+# Cron envelope the upstream scheduler splices into delivered text (scheduler_delivery.py:
+# "Cronjob Response: {name}\n(job_id: {id})\n----...\n\n{content}\n\nTo stop or manage...").
+# The framework does NOT pass job_id via metadata yet (upstream issue #26004), so detect the
+# envelope in the text itself.
+_CRON_ENVELOPE_PREFIX = "Cronjob Response: "
 _QUIET_SENTINEL = "quiet:swallowed"
+
+
+def _parse_cron_envelope(content: str):
+    """Split the scheduler's cron envelope → (task_name, body) or None if not a cron send."""
+    text = content.strip()
+    if not text.startswith(_CRON_ENVELOPE_PREFIX):
+        return None
+    lines = text.splitlines()
+    task_name = lines[0][len(_CRON_ENVELOPE_PREFIX):].strip()
+    # drop "(job_id: ...)" and the "-----" separator lines
+    body_lines = [l for l in lines[1:] if not l.strip().startswith("(job_id:")
+                  and not set(l.strip()) <= {"-"}]
+    body = "\n".join(body_lines).strip()
+    # strip the trailing management footer
+    for marker in ("To stop or manage this job",):
+        idx = body.find(marker)
+        if idx > 0:
+            body = body[:idx].strip()
+    return task_name, body
 
 
 def _cardkit_available() -> bool:
@@ -179,16 +202,26 @@ if _BUILTIN_AVAILABLE:
 
             md = metadata or {}
 
-            # Cron/scheduled deliveries (metadata carries job_id): render as a static
-            # card so every Feishu surface has the unified look (CEO 2026-09-26).
-            if md.get("job_id") and self._cardkit_streaming_available():
+            # Cron/scheduled deliveries: render as a static card so every Feishu surface
+            # has the unified look (CEO 2026-09-26). Two detection paths:
+            #   a) metadata carries job_id (future: upstream issue #26004 lands)
+            #   b) the scheduler's text envelope "Cronjob Response: ..." (today's reality)
+            is_cron = bool(md.get("job_id"))
+            cron_task = md.get("job_name")
+            cron_body = content
+            if not is_cron:
+                parsed = _parse_cron_envelope(content) if _cardkit_streaming_available() else None
+                if parsed:
+                    is_cron = True
+                    cron_task, cron_body = parsed
+            if is_cron and self._cardkit_streaming_available():
                 try:
                     from datetime import datetime as _dt
                     if self._cardkit is None:
                         self._cardkit = CardKitStreamManager(self)
                     card_json = build_cron_card(
-                        md.get("job_name") or "定时任务", content,
-                        job_name=md.get("job_name"),
+                        cron_task or "定时任务", cron_body,
+                        job_name=cron_task,
                         timestamp=_dt.now().strftime("%m-%d %H:%M"),
                     )
                     return await self._cardkit.send_static_card(chat_id, card_json, metadata=metadata)
