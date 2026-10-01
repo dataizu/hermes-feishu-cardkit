@@ -210,7 +210,7 @@ if _BUILTIN_AVAILABLE:
             cron_task = md.get("job_name")
             cron_body = content
             if not is_cron:
-                parsed = _parse_cron_envelope(content) if _cardkit_streaming_available() else None
+                parsed = _parse_cron_envelope(content) if self._cardkit_streaming_available() else None
                 if parsed:
                     is_cron = True
                     cron_task, cron_body = parsed
