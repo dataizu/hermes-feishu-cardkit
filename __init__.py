@@ -347,31 +347,30 @@ if _BUILTIN_AVAILABLE:
                 resolved = resolve_gateway_clarify(clarify_id, choice)
                 info = self._clarify_cards.pop(clarify_id, None)
                 loop = self._loop
-                if info and loop is not None and self._loop_accepts_callbacks(loop):
+                if loop is not None and self._loop_accepts_callbacks(loop):
+                    question = info["question"] if info else ""
+                    card_id = (info or {}).get("card_id") or ""
                     async def _swap() -> None:
                         try:
-                            if self._cardkit is None:
-                                self._cardkit = CardKitStreamManager(self)
-                            card_json = build_clarify_card(
-                                info["question"], info["choices"], clarify_id=clarify_id)
-                            # answered look: question + picked choice, no buttons
-                            answered = {
-                                "schema": "2.0",
-                                "config": {"streaming_mode": False, "locales": ["zh_cn", "en_us"],
-                                           "update_multi": True,
-                                           "summary": {"content": "Choice made",
-                                                       "i18n_content": {"zh_cn": "已选择",
-                                                                        "en_us": "Choice made"}}},
-                                "body": {"elements": [
-                                    {"tag": "markdown", "content": info["question"],
-                                     "text_align": "left", "text_size": "normal_v2"},
-                                    {"tag": "markdown",
-                                     "content": f"✅ 已选择：**{choice}**",
-                                     "text_size": "notation"},
-                                ]},
-                            }
-                            card_id = info.get("card_id") or ""
                             if card_id:
+                                if self._cardkit is None:
+                                    self._cardkit = CardKitStreamManager(self)
+                                answered = {
+                                    "schema": "2.0",
+                                    "config": {"streaming_mode": False, "locales": ["zh_cn", "en_us"],
+                                               "update_multi": True,
+                                               "summary": {"content": "Choice made",
+                                                           "i18n_content": {"zh_cn": "已选择",
+                                                                            "en_us": "Choice made"}}},
+                                    "body": {"elements": [
+                                        {"tag": "markdown", "content": question or "（问题已过期）",
+                                         "text_align": "left", "text_size": "normal_v2"},
+                                        {"tag": "markdown",
+                                         "content": (f"✅ 已选择：**{choice}**" if resolved
+                                                     else f"⚠️ 已选 {choice}（原问题已过期或已回答）"),
+                                         "text_size": "notation"},
+                                    ]},
+                                }
                                 await self._cardkit.update_card(card_id, answered, sequence=2)
                         except Exception as exc:
                             logger.debug("[CardKit] clarify card swap failed: %s", exc)
@@ -379,11 +378,13 @@ if _BUILTIN_AVAILABLE:
                     safe_schedule_threadsafe(
                         _swap(), loop, logger=logger,
                         log_message="[CardKit] clarify swap scheduling failed")
-                if not resolved:
-                    # stale click (already answered/timeout): still swap the card look
-                    logger.info("[feishu-cardkit] clarify click for expired id=%s", clarify_id)
-                # inline card response not needed (we async-swap); return plain ack
-                return self._card_response()
+                # toast: immediate click feedback in the client (avoids the "no response" feel)
+                resp = self._card_response()
+                try:
+                    resp.toast = {"type": "info", "content": f"已选择：{choice}"[:40]}
+                except Exception:
+                    pass
+                return resp
             except Exception as exc:
                 logger.warning("[feishu-cardkit] clarify click handling failed: %s", exc)
                 return super()._on_card_action_trigger(data)
