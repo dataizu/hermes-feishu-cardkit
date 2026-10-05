@@ -52,6 +52,7 @@ try:
         _apply_yaml_config,
         _is_connected,
         _standalone_send,
+        _sdk_domain,
     )
     _BUILTIN_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - broken install, register nothing
@@ -423,8 +424,49 @@ if _BUILTIN_AVAILABLE:
                 return super()._on_card_action_trigger(data)
 
 
+async def _cardkit_standalone_send(pconfig, chat_id, message, *, thread_id=None,
+                                   media_files=None, force_document=False):
+    """CardKit-aware standalone send (cron 交付统一卡片, CEO 2026-09-26).
+
+    Cron deliveries that run OUTSIDE the gateway (scheduler standalone lane) call the
+    registry's ``standalone_sender_fn`` — the built-in one sends plain text, bypassing
+    adapter.send() entirely. This wrapper intercepts the cron text envelope and renders
+    a card first; everything else (media, non-cron text, any card failure) defers to
+    the built-in standalone sender.
+    """
+    if _BUILTIN_AVAILABLE and _cardkit_available():
+        parsed = _parse_cron_envelope(message or "")
+        if parsed:
+            try:
+                task_name, body = parsed
+                from datetime import datetime as _dt
+                manager = CardKitStreamManager.__new__(CardKitStreamManager)
+                # send_static_card needs only _adapter; build a transient adapter like the
+                # built-in standalone sender does (no gateway loop required).
+                adapter = FeishuAdapter(pconfig)
+                adapter._client = adapter._build_lark_client(_sdk_domain(getattr(adapter, "_domain_name", "feishu")))
+                manager._adapter = adapter
+                card_json = build_cron_card(
+                    task_name, body, job_name=task_name,
+                    timestamp=_dt.now().strftime("%m-%d %H:%M"))
+                result = await manager.send_static_card(chat_id, card_json)
+                if result.success and result.message_id:
+                    # media (rare for cron) still goes through the built-in lane
+                    if media_files:
+                        return await _standalone_send(pconfig, chat_id, "", thread_id=thread_id,
+                                                      media_files=media_files,
+                                                      force_document=force_document)
+                    return {"success": True, "platform": "feishu", "chat_id": chat_id,
+                            "message_id": result.message_id, "card": True}
+                logger.warning("[feishu-cardkit] standalone cron card failed (%s), falling back to text",
+                               getattr(result, "error", "unknown"))
+            except Exception as exc:
+                logger.warning("[feishu-cardkit] standalone cron card error: %s", exc)
+    return await _standalone_send(pconfig, chat_id, message, thread_id=thread_id,
+                                  media_files=media_files, force_document=force_document)
+
+
 def _check_requirements() -> bool:
-    """PASSIVE probe: built-in deps AND the cardkit SDK surface."""
     if not _BUILTIN_AVAILABLE:
         return False
     if not feishu_deps_present():
@@ -452,7 +494,7 @@ def register(ctx) -> None:
         allowed_users_env="FEISHU_ALLOWED_USERS",
         allow_all_env="FEISHU_ALLOW_ALL_USERS",
         cron_deliver_env_var="FEISHU_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send,
+        standalone_sender_fn=_cardkit_standalone_send,
         max_message_length=8000,
         emoji="🪽",
         allow_update_command=True,
