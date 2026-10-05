@@ -220,10 +220,13 @@ if _BUILTIN_AVAILABLE:
                     from datetime import datetime as _dt
                     if self._cardkit is None:
                         self._cardkit = CardKitStreamManager(self)
+                    task_lower = (cron_task or "").lower()
+                    is_alarm = any(k in task_lower for k in ("watchdog", "告警", "警报", "alarm", "alert", "红警"))
                     card_json = build_cron_card(
                         cron_task or "定时任务", cron_body,
                         job_name=cron_task,
                         timestamp=_dt.now().strftime("%m-%d %H:%M"),
+                        alarm=is_alarm,
                     )
                     return await self._cardkit.send_static_card(chat_id, card_json, metadata=metadata)
                 except Exception as exc:
@@ -446,9 +449,12 @@ async def _cardkit_standalone_send(pconfig, chat_id, message, *, thread_id=None,
                 adapter = FeishuAdapter(pconfig)
                 adapter._client = adapter._build_lark_client(_sdk_domain(getattr(adapter, "_domain_name", "feishu")))
                 manager._adapter = adapter
+                task_lower = (task_name or "").lower()
+                is_alarm = any(k in task_lower for k in ("watchdog", "告警", "警报", "alarm", "alert", "红警"))
                 card_json = build_cron_card(
                     task_name, body, job_name=task_name,
-                    timestamp=_dt.now().strftime("%m-%d %H:%M"))
+                    timestamp=_dt.now().strftime("%m-%d %H:%M"),
+                    alarm=is_alarm)
                 result = await manager.send_static_card(chat_id, card_json)
                 if result.success and result.message_id:
                     # media (rare for cron) still goes through the built-in lane

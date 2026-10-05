@@ -317,28 +317,33 @@ def build_completed_card(text: str, *, elapsed_ms: Optional[float], model: Optio
 
 
 def build_cron_card(title: str, content: str, *, job_name: Optional[str] = None,
-                    timestamp: Optional[str] = None) -> Dict[str, Any]:
+                    timestamp: Optional[str] = None,
+                    color: str = "blue", alarm: bool = False) -> Dict[str, Any]:
     """Static card for cron/scheduled deliveries (unified look, CEO 2026-09-26).
 
-    Grey header line: ⏰ job name + delivery time; body: the job's content styled
+    Colored header bar (schema 2.0 ``header.template`` — CEO 2026-10-05 request):
+    title = job name, sub-title = delivery time; body = the job's content styled
     like a completed card (no streaming, no footer — it arrives finished).
+    ``alarm=True`` renders red (watchdog/alert jobs), else ``color`` (default blue).
     """
-    header_parts = ["⏰ " + (job_name or title or "定时任务")]
+    header: Dict[str, Any] = {
+        "title": {"tag": "plain_text",
+                  "content": ("🚨 " if alarm else "⏰ ") + (job_name or title or "定时任务"),
+                  "i18n_content": {"zh_cn": ("🚨 " if alarm else "⏰ ") + (job_name or title or "定时任务"),
+                                   "en_us": ("🚨 " if alarm else "⏰ ") + (job_name or title or "Scheduled task")}},
+        "template": "red" if alarm else color,
+    }
     if timestamp:
-        header_parts.append(timestamp)
-    elements: list = [{
-        "tag": "markdown",
-        "content": " · ".join(header_parts),
-        "i18n_content": {"zh_cn": " · ".join(header_parts), "en_us": " · ".join(header_parts)},
-        "text_size": "notation",
-        "text_color": "grey",
-        "element_id": "cron_header",
-    }]
+        header["subtitle"] = {
+            "tag": "plain_text",
+            "content": f"投递时间 {timestamp}",
+            "i18n_content": {"zh_cn": f"投递时间 {timestamp}", "en_us": f"Delivered {timestamp}"},
+        }
     styled = optimize_markdown_style(content) if content else ""
-    elements.extend(
+    elements: list = [
         {"tag": "markdown", "content": chunk, "text_align": "left", "text_size": "normal_v2"}
         for chunk in (chunk_card_text(styled) or ["（无内容）"])
-    )
+    ]
     return {
         "schema": "2.0",
         "config": {
@@ -350,6 +355,7 @@ def build_cron_card(title: str, content: str, *, job_name: Optional[str] = None,
                 "i18n_content": {"zh_cn": "定时投递", "en_us": "Scheduled delivery"},
             },
         },
+        "header": header,
         "body": {"elements": elements},
     }
 

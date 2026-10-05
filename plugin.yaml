@@ -1,7 +1,7 @@
 name: hermes-feishu-cardkit
 label: Feishu CardKit Streaming
 kind: platform
-version: 1.6.0
+version: 1.7.0
 description: >
   Drop-in upgrade for the built-in Feishu/Lark gateway channel: replies render as
   CardKit 2.0 streaming cards (typewriter effect, collapsible tool-summary panel,
